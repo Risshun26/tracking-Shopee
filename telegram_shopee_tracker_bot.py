@@ -4,20 +4,26 @@ import json
 import requests
 import threading
 from flask import Flask, request, jsonify
-from telegram import Bot, Update, ParseMode
-from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, CallbackContext
+from telegram import Update, Bot, ParseMode
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 # --- Configuration ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")  # Set in Render environment variables
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://your-app.onrender.com/webhook
 DATA_FILE = "tracked.json"
 SPX_ENDPOINT = "https://spx.vn/api/v2/track/track-package?billCode="
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))  # seconds between polls
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 
-# --- Initialize bot & Flask app ---
+# --- Initialize bot & Flask ---
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 app = Flask(__name__)
-dispatcher = Dispatcher(bot, None, workers=1, use_context=True) if bot else None  # 1 worker to avoid duplicate notifications
+application = ApplicationBuilder().token(BOT_TOKEN).build() if bot else None
 
 # ---------------- Storage helpers ----------------
 def load_data():
@@ -52,7 +58,7 @@ def query_spx(tracking_number):
             "status_code": status,
             "status_text": status,
             "last_update": time.time(),
-            "history": hist
+            "history": hist,
         }
     except Exception:
         return None
@@ -73,16 +79,20 @@ def format_tracking_text(courier, tracking, info):
     return f"<b>{courier.upper()} {tracking}</b>\nTrạng thái: {status}\nCập nhật: {t}\nLịch sử:\n{hist_txt}"
 
 # ---------------- Command Handlers ----------------
-def start(update, context: CallbackContext):
-    update.message.reply_text("Xin chào! Gửi /track <mã> để lưu mã theo dõi hoặc /check <mã> để kiểm tra nhanh.")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Xin chào! Gửi /track <mã> để lưu mã theo dõi hoặc /check <mã> để kiểm tra nhanh."
+    )
 
-def help_cmd(update, context: CallbackContext):
-    update.message.reply_text("/track <mã> - lưu theo dõi\n/check <mã> - kiểm tra nhanh\n/list - xem danh sách\n/remove <mã> - xoá mã")
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "/track <mã> - lưu theo dõi\n/check <mã> - kiểm tra nhanh\n/list - xem danh sách\n/remove <mã> - xoá mã"
+    )
 
-def track(update, context: CallbackContext):
+async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 1:
-        update.message.reply_text("Cú pháp: /track <mã_vận_đơn>")
+        await update.message.reply_text("Cú pháp: /track <mã_vận_đơn>")
         return
     tracking = args[0].strip()
     courier = "spx"
@@ -92,70 +102,84 @@ def track(update, context: CallbackContext):
     chat_subs = subs.setdefault(chat_id, [])
     for s in chat_subs:
         if s.get("courier") == courier and s.get("tracking") == tracking:
-            update.message.reply_text("Mã này đã được thêm trước đó.")
+            await update.message.reply_text("Mã này đã được thêm trước đó.")
             return
-    info = query_spx(tracking) or {"status_code":"UNKNOWN","status_text":"Chưa có thông tin","last_update":time.time(),"history":[]}
-    entry = {"courier":courier,"tracking":tracking,"last_status":info.get("status_code"),"last_text":info.get("status_text"),"last_update":info.get("last_update",time.time())}
+    info = query_spx(tracking) or {
+        "status_code": "UNKNOWN",
+        "status_text": "Chưa có thông tin",
+        "last_update": time.time(),
+        "history": [],
+    }
+    entry = {
+        "courier": courier,
+        "tracking": tracking,
+        "last_status": info.get("status_code"),
+        "last_text": info.get("status_text"),
+        "last_update": info.get("last_update", time.time()),
+    }
     chat_subs.append(entry)
     save_data(data)
-    update.message.reply_text(f"Đã thêm: {tracking} — {entry['last_text']}")
+    await update.message.reply_text(f"Đã thêm: {tracking} — {entry['last_text']}")
 
-def check(update, context: CallbackContext):
+async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 1:
-        update.message.reply_text("Cú pháp: /check <mã_vận_đơn>")
+        await update.message.reply_text("Cú pháp: /check <mã_vận_đơn>")
         return
     tracking = args[0].strip()
     info = query_spx(tracking)
     if not info:
-        update.message.reply_text("Không lấy được thông tin.")
+        await update.message.reply_text("Không lấy được thông tin.")
         return
-    update.message.reply_text(format_tracking_text("spx", tracking, info), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        format_tracking_text("spx", tracking, info), parse_mode=ParseMode.HTML
+    )
 
-def list_tracks(update, context: CallbackContext):
+async def list_tracks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     chat_id = str(update.effective_chat.id)
     chat_subs = data.get("subscriptions", {}).get(chat_id, [])
     if not chat_subs:
-        update.message.reply_text("Không có mã đang theo dõi.")
+        await update.message.reply_text("Không có mã đang theo dõi.")
         return
     lines = [f"{s['courier']} {s['tracking']} — {s.get('last_text','?')}" for s in chat_subs]
-    update.message.reply_text("Danh sách:\n" + "\n".join(lines))
+    await update.message.reply_text("Danh sách:\n" + "\n".join(lines))
 
-def remove(update, context: CallbackContext):
+async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 1:
-        update.message.reply_text("Cú pháp: /remove <mã_vận_đơn>")
+        await update.message.reply_text("Cú pháp: /remove <mã_vận_đơn>")
         return
     tracking = args[0].strip()
     courier = "spx"
     data = load_data()
     chat_id = str(update.effective_chat.id)
     chat_subs = data.get("subscriptions", {}).get(chat_id, [])
-    new_subs = [s for s in chat_subs if not (s['courier']==courier and s['tracking']==tracking)]
+    new_subs = [s for s in chat_subs if not (s['courier'] == courier and s['tracking'] == tracking)]
     data.setdefault("subscriptions", {})[chat_id] = new_subs
     save_data(data)
-    update.message.reply_text("Đã xóa.")
+    await update.message.reply_text("Đã xóa.")
 
-def echo_message(update, context: CallbackContext):
+async def echo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
     if 6 <= len(txt) <= 40 and any(c.isdigit() for c in txt):
         info = query_spx(txt)
         if info:
-            update.message.reply_text(format_tracking_text("spx", txt, info), parse_mode=ParseMode.HTML)
+            await update.message.reply_text(format_tracking_text("spx", txt, info), parse_mode=ParseMode.HTML)
             return
-    update.message.reply_text("Gõ /help để xem lệnh.")
+    await update.message.reply_text("Gõ /help để xem lệnh.")
 
-if dispatcher:
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(CommandHandler("help", help_cmd))
-    dispatcher.add_handler(CommandHandler("track", track))
-    dispatcher.add_handler(CommandHandler("check", check))
-    dispatcher.add_handler(CommandHandler("list", list_tracks))
-    dispatcher.add_handler(CommandHandler("remove", remove))
-    dispatcher.add_handler(MessageHandler(Filters.text & (~Filters.command), echo_message))
+# ---------------- Register handlers ----------------
+if application:
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("track", track))
+    application.add_handler(CommandHandler("check", check))
+    application.add_handler(CommandHandler("list", list_tracks))
+    application.add_handler(CommandHandler("remove", remove))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), echo_message))
 
-# ---------------- Background auto-update poller ----------------
+# ---------------- Background poller ----------------
 def background_checker():
     while True:
         data = load_data()
@@ -196,4 +220,6 @@ def webhook():
         return jsonify({"ok": False, "error": "Bot token not configured"}), 500
     try:
         update = Update.de_json(request.get_json(force=True), bot)
-       
+        application.update_queue.put(update)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}),
