@@ -8,7 +8,7 @@ from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
 
 # --- Configuration ---
 BOT_TOKEN = os.getenv("8339982187:AAErR-8XQ7ZEKGJmdoG-RR_Ad6hoTDTbRE4")  # set this in Render environment variables
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # optional: e.g. https://your-app.onrender.com/webhook
+WEBHOOK_URL = os.getenv("https://tracking-shopee.onrender.com")  # optional: e.g. https://your-app.onrender.com/webhook
 DATA_FILE = "tracked.json"
 SPX_ENDPOINT = "https://spx.vn/api/v2/track/track-package?billCode="
 
