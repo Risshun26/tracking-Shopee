@@ -2,22 +2,22 @@ import os
 import time
 import json
 import requests
+import threading
 from flask import Flask, request, jsonify
 from telegram import Bot, Update, ParseMode
-from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
+from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, CallbackContext
 
 # --- Configuration ---
-BOT_TOKEN = os.getenv("8339982187:AAErR-8XQ7ZEKGJmdoG-RR_Ad6hoTDTbRE4")  # set this in Render environment variables
-WEBHOOK_URL = os.getenv("https://tracking-shopee.onrender.com")  # optional: e.g. https://your-app.onrender.com/webhook
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Set in Render environment variables
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://your-app.onrender.com/webhook
 DATA_FILE = "tracked.json"
 SPX_ENDPOINT = "https://spx.vn/api/v2/track/track-package?billCode="
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))  # seconds between polls
 
-# --- Initialize bot & flask app ---
+# --- Initialize bot & Flask app ---
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 app = Flask(__name__)
-
-# Create a dispatcher for handling updates
-dispatcher = Dispatcher(bot, None, workers=4, use_context=True) if bot else None
+dispatcher = Dispatcher(bot, None, workers=1, use_context=True) if bot else None  # 1 worker to avoid duplicate notifications
 
 # ---------------- Storage helpers ----------------
 def load_data():
@@ -44,12 +44,9 @@ def query_spx(tracking_number):
             return None
         status = data.get("statusText") or data.get("status")
         history = data.get("tracking") or []
-        # Normalize history items
         hist = []
         for h in history:
-            # SPX may use keys like updateTime and message
             ts = h.get("updateTime") or h.get("time")
-            # Try to parse timestamp if numeric / string; we'll keep raw
             hist.append({"time": ts, "desc": h.get("message") or h.get("desc") or h.get("status")})
         return {
             "status_code": status,
@@ -67,7 +64,6 @@ def format_tracking_text(courier, tracking, info):
     t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last)) if last else ""
     history = info.get("history", [])
     hist_lines = []
-    # show up to last 5
     for h in (history[-5:][::-1] if history else []):
         ts = h.get("time")
         if isinstance(ts, (int, float)):
@@ -77,20 +73,13 @@ def format_tracking_text(courier, tracking, info):
     return f"<b>{courier.upper()} {tracking}</b>\nTrạng thái: {status}\nCập nhật: {t}\nLịch sử:\n{hist_txt}"
 
 # ---------------- Command Handlers ----------------
-def start(update, context):
-    update.message.reply_text(
-        "Xin chào! Gửi /track <mã> để lưu mã theo dõi (ví dụ: /track SPXVN0123456789) hoặc /check <mã> để kiểm tra nhanh."
-    )
+def start(update, context: CallbackContext):
+    update.message.reply_text("Xin chào! Gửi /track <mã> để lưu mã theo dõi hoặc /check <mã> để kiểm tra nhanh.")
 
-def help_cmd(update, context):
-    update.message.reply_text(
-        "/track <mã> - lưu mã theo dõi cho chat này\n"
-        "/check <mã> - kiểm tra mã ngay (không lưu)\n"
-        "/list - danh sách mã đang theo dõi cho chat\n"
-        "/remove <mã> - xoá mã khỏi theo dõi\n"
-    )
+def help_cmd(update, context: CallbackContext):
+    update.message.reply_text("/track <mã> - lưu theo dõi\n/check <mã> - kiểm tra nhanh\n/list - xem danh sách\n/remove <mã> - xoá mã")
 
-def track(update, context):
+def track(update, context: CallbackContext):
     args = context.args
     if len(args) != 1:
         update.message.reply_text("Cú pháp: /track <mã_vận_đơn>")
@@ -102,16 +91,16 @@ def track(update, context):
     subs = data.setdefault("subscriptions", {})
     chat_subs = subs.setdefault(chat_id, [])
     for s in chat_subs:
-        if s.get("courier")==courier and s.get("tracking")==tracking:
+        if s.get("courier") == courier and s.get("tracking") == tracking:
             update.message.reply_text("Mã này đã được thêm trước đó.")
             return
     info = query_spx(tracking) or {"status_code":"UNKNOWN","status_text":"Chưa có thông tin","last_update":time.time(),"history":[]}
     entry = {"courier":courier,"tracking":tracking,"last_status":info.get("status_code"),"last_text":info.get("status_text"),"last_update":info.get("last_update",time.time())}
     chat_subs.append(entry)
     save_data(data)
-    update.message.reply_text(f"Đã thêm theo dõi: {courier} {tracking}\nTrạng thái: {entry['last_text']}")
+    update.message.reply_text(f"Đã thêm: {tracking} — {entry['last_text']}")
 
-def check(update, context):
+def check(update, context: CallbackContext):
     args = context.args
     if len(args) != 1:
         update.message.reply_text("Cú pháp: /check <mã_vận_đơn>")
@@ -119,24 +108,23 @@ def check(update, context):
     tracking = args[0].strip()
     info = query_spx(tracking)
     if not info:
-        update.message.reply_text("Không lấy được thông tin. Vui lòng thử lại sau.")
+        update.message.reply_text("Không lấy được thông tin.")
         return
-    txt = format_tracking_text("spx", tracking, info)
-    update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+    update.message.reply_text(format_tracking_text("spx", tracking, info), parse_mode=ParseMode.HTML)
 
-def list_tracks(update, context):
+def list_tracks(update, context: CallbackContext):
     data = load_data()
     chat_id = str(update.effective_chat.id)
     chat_subs = data.get("subscriptions", {}).get(chat_id, [])
     if not chat_subs:
-        update.message.reply_text("Không có mã nào được theo dõi trong chat này.")
+        update.message.reply_text("Không có mã đang theo dõi.")
         return
     lines = [f"{s['courier']} {s['tracking']} — {s.get('last_text','?')}" for s in chat_subs]
-    update.message.reply_text("Các mã đang theo dõi:\n" + "\n".join(lines))
+    update.message.reply_text("Danh sách:\n" + "\n".join(lines))
 
-def remove(update, context):
+def remove(update, context: CallbackContext):
     args = context.args
-    if len(args)!=1:
+    if len(args) != 1:
         update.message.reply_text("Cú pháp: /remove <mã_vận_đơn>")
         return
     tracking = args[0].strip()
@@ -147,12 +135,10 @@ def remove(update, context):
     new_subs = [s for s in chat_subs if not (s['courier']==courier and s['tracking']==tracking)]
     data.setdefault("subscriptions", {})[chat_id] = new_subs
     save_data(data)
-    update.message.reply_text("Đã xóa nếu tồn tại.")
+    update.message.reply_text("Đã xóa.")
 
-def echo_message(update, context):
-    # If user sends a plain message that looks like a tracking code, auto-check it
+def echo_message(update, context: CallbackContext):
     txt = update.message.text.strip()
-    # simple heuristic: contains letters+digits and length between 6 and 30
     if 6 <= len(txt) <= 40 and any(c.isdigit() for c in txt):
         info = query_spx(txt)
         if info:
@@ -160,7 +146,6 @@ def echo_message(update, context):
             return
     update.message.reply_text("Gõ /help để xem lệnh.")
 
-# ---------------- Register handlers if dispatcher available ----------------
 if dispatcher:
     dispatcher.add_handler(CommandHandler("start", start))
     dispatcher.add_handler(CommandHandler("help", help_cmd))
@@ -170,10 +155,40 @@ if dispatcher:
     dispatcher.add_handler(CommandHandler("remove", remove))
     dispatcher.add_handler(MessageHandler(Filters.text & (~Filters.command), echo_message))
 
+# ---------------- Background auto-update poller ----------------
+def background_checker():
+    while True:
+        data = load_data()
+        subs = data.get("subscriptions", {})
+        changed = False
+        for chat_id, items in subs.items():
+            for entry in items:
+                courier = entry["courier"]
+                tracking = entry["tracking"]
+                info = query_spx(tracking)
+                if not info:
+                    continue
+                new_status = info.get("status_text")
+                old_status = entry.get("last_text")
+                if new_status != old_status:
+                    msg = f"📦 <b>{courier.upper()} {tracking}</b>\nĐã cập nhật trạng thái mới:\n<b>{new_status}</b>"
+                    try:
+                        bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+                    except:
+                        pass
+                    entry["last_text"] = new_status
+                    entry["last_update"] = info.get("last_update", time.time())
+                    changed = True
+        if changed:
+            save_data(data)
+        time.sleep(POLL_INTERVAL)
+
+threading.Thread(target=background_checker, daemon=True).start()
+
 # ---------------- Flask routes ----------------
 @app.route("/")
 def index():
-    return "Shopee Tracker Bot (webhook) is running."
+    return "Shopee Tracker Bot is running."
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -181,32 +196,4 @@ def webhook():
         return jsonify({"ok": False, "error": "Bot token not configured"}), 500
     try:
         update = Update.de_json(request.get_json(force=True), bot)
-        dispatcher.process_update(update)
-    except Exception as e:
-        # return error for debugging
-        return jsonify({"ok": False, "error": str(e)}), 400
-    return jsonify({"ok": True})
-
-@app.route("/set_webhook", methods=["GET"])
-def set_webhook():
-    # optional convenience route to set webhook using WEBHOOK_URL env var
-    if not bot:
-        return "BOT_TOKEN not configured", 500
-    url = WEBHOOK_URL or request.args.get("url")
-    if not url:
-        return "Provide WEBHOOK_URL env var or ?url=", 400
-    hook = url.rstrip("/") + "/webhook"
-    s = bot.set_webhook(hook)
-    return f"set_webhook: {s} -> {hook}"
-
-if __name__ == "__main__":
-    # If WEBHOOK_URL provided at startup, attempt to set webhook (useful for Render)
-    if bot and WEBHOOK_URL:
-        try:
-            hook = WEBHOOK_URL.rstrip("/") + "/webhook"
-            bot.set_webhook(hook)
-            print("Webhook set to", hook)
-        except Exception as e:
-            print("Failed to set webhook on startup:", e)
-    # Run Flask (gunicorn will be used in Render)
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+       
